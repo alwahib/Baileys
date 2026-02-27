@@ -35,9 +35,11 @@ import {
 	decodePatches,
 	decodeSyncdSnapshot,
 	encodeSyncdPatch,
+	ensureLTHashStateVersion,
 	extractSyncdPatches,
 	generateProfilePicture,
 	getHistoryMsg,
+	isAppStateSyncIrrecoverable,
 	newLTHashState,
 	processSyncAction
 } from '../Utils'
@@ -48,6 +50,8 @@ import {
 	type BinaryNode,
 	getBinaryNodeChild,
 	getBinaryNodeChildren,
+	isLidUser,
+	isPnUser,
 	jidDecode,
 	jidNormalizedUser,
 	reduceBinaryNodeToDictionary,
@@ -55,7 +59,6 @@ import {
 } from '../WABinary'
 import { USyncQuery, USyncUser } from '../WAUSync'
 import { makeSocket } from './socket.js'
-const MAX_SYNC_ATTEMPTS = 2
 
 export const makeChatsSocket = (config: SocketConfig) => {
 	const {
@@ -79,6 +82,8 @@ export const makeChatsSocket = (config: SocketConfig) => {
 		onUnexpectedError,
 		sendUnifiedSession
 	} = sock
+
+	const getLIDForPN = signalRepository.lidMapping.getLIDForPN.bind(signalRepository.lidMapping)
 
 	let privacySettings: { [_: string]: string } | undefined
 
@@ -501,6 +506,9 @@ export const makeChatsSocket = (config: SocketConfig) => {
 				const collectionsToHandle = new Set<string>(collections)
 				// in case something goes wrong -- ensure we don't enter a loop that cannot be exited from
 				const attemptsMap: { [T in WAPatchName]?: number } = {}
+				// collections that failed and need a full snapshot on retry
+				// mirrors WA Web's ErrorFatal -> force snapshot behavior
+				const forceSnapshotCollections = new Set<WAPatchName>()
 				// keep executing till all collections are done
 				// sometimes a single patch request will not return all the patches (God knows why)
 				// so we fetch till they're all done (this is determined by the "has_more_patches" flag)
@@ -513,6 +521,7 @@ export const makeChatsSocket = (config: SocketConfig) => {
 						let state = result[name]
 
 						if (state) {
+							state = ensureLTHashStateVersion(state)
 							if (typeof initialVersionMap[name] === 'undefined') {
 								initialVersionMap[name] = state.version
 							}
@@ -522,15 +531,20 @@ export const makeChatsSocket = (config: SocketConfig) => {
 
 						states[name] = state
 
-						logger.info(`resyncing ${name} from v${state.version}`)
+						const shouldForceSnapshot = forceSnapshotCollections.has(name)
+						if (shouldForceSnapshot) {
+							forceSnapshotCollections.delete(name)
+						}
+
+						logger.info(`resyncing ${name} from v${state.version}${shouldForceSnapshot ? ' (forcing snapshot)' : ''}`)
 
 						nodes.push({
 							tag: 'collection',
 							attrs: {
 								name,
 								version: state.version.toString(),
-								// return snapshot if being synced from scratch
-								return_snapshot: (!state.version).toString()
+								// return snapshot if syncing from scratch or forcing after a failed attempt
+								return_snapshot: (shouldForceSnapshot || !state.version).toString()
 							}
 						})
 					}
@@ -601,23 +615,26 @@ export const makeChatsSocket = (config: SocketConfig) => {
 								collectionsToHandle.delete(name)
 							}
 						} catch (error: any) {
-							// if retry attempts overshoot
-							// or key not found
-							const isIrrecoverableError =
-								attemptsMap[name]! >= MAX_SYNC_ATTEMPTS ||
-								error.output?.statusCode === 404 ||
-								error.name === 'TypeError'
-							logger.info(
-								{ name, error: error.stack },
-								`failed to sync state from version${isIrrecoverableError ? '' : ', removing and trying from scratch'}`
-							)
-							await authState.keys.set({ 'app-state-sync-version': { [name]: null } })
-							// increment number of retries
 							attemptsMap[name] = (attemptsMap[name] || 0) + 1
 
-							if (isIrrecoverableError) {
-								// stop retrying
+							const irrecoverable = isAppStateSyncIrrecoverable(error, attemptsMap[name])
+							const logData = {
+								name,
+								attempt: attemptsMap[name],
+								version: states[name].version,
+								statusCode: error.output?.statusCode,
+								errorType: error.name,
+								error: error.stack
+							}
+
+							if (irrecoverable) {
+								logger.warn(logData, `failed to sync ${name} from v${states[name].version}, giving up`)
 								collectionsToHandle.delete(name)
+							} else {
+								logger.info(logData, `failed to sync ${name} from v${states[name].version}, forcing snapshot retry`)
+								// force a full snapshot on retry to recover from
+								// corrupted local state (e.g. LTHash MAC mismatch)
+								forceSnapshotCollections.add(name)
 							}
 						}
 					}
@@ -639,7 +656,24 @@ export const makeChatsSocket = (config: SocketConfig) => {
 	const profilePictureUrl = async (jid: string, type: 'preview' | 'image' = 'preview', timeoutMs?: number) => {
 		const baseContent: BinaryNode[] = [{ tag: 'picture', attrs: { type, query: 'url' } }]
 
-		const tcTokenContent = await buildTcTokenFromJid({ authState, jid, baseContent })
+		// WA Web only includes tctoken for user JIDs (not groups/newsletters)
+		// and never for own profile pic (Chat model for self has no tcToken).
+		// Including tctoken for own JID causes the server to never respond.
+		const normalizedJid = jidNormalizedUser(jid)
+		const isUserJid = isPnUser(normalizedJid) || isLidUser(normalizedJid)
+		const me = authState.creds.me
+		const isSelf =
+			me && (normalizedJid === jidNormalizedUser(me.id) || (me.lid && normalizedJid === jidNormalizedUser(me.lid)))
+		let content: BinaryNode[] | undefined = baseContent
+
+		if (isUserJid && !isSelf) {
+			content = await buildTcTokenFromJid({
+				authState,
+				jid: normalizedJid,
+				baseContent,
+				getLIDForPN
+			})
+		}
 
 		jid = jidNormalizedUser(jid)
 		const result = await query(
@@ -651,7 +685,7 @@ export const makeChatsSocket = (config: SocketConfig) => {
 					type: 'get',
 					xmlns: 'w:profile:picture'
 				},
-				content: tcTokenContent
+				content
 			},
 			timeoutMs
 		)
@@ -728,7 +762,12 @@ export const makeChatsSocket = (config: SocketConfig) => {
 	 * @param tcToken token for subscription, use if present
 	 */
 	const presenceSubscribe = async (toJid: string) => {
-		const tcTokenContent = await buildTcTokenFromJid({ authState, jid: toJid })
+		// Only include tctoken for user JIDs — groups/newsletters don't use tctokens
+		const normalizedToJid = jidNormalizedUser(toJid)
+		const isUserJid = isPnUser(normalizedToJid) || isLidUser(normalizedToJid)
+		const tcTokenContent = isUserJid
+			? await buildTcTokenFromJid({ authState, jid: normalizedToJid, getLIDForPN })
+			: undefined
 
 		return sendNode({
 			tag: 'presence',
@@ -793,7 +832,7 @@ export const makeChatsSocket = (config: SocketConfig) => {
 				await resyncAppState([name], false)
 
 				const { [name]: currentSyncVersion } = await authState.keys.get('app-state-sync-version', [name])
-				initial = currentSyncVersion || newLTHashState()
+				initial = currentSyncVersion ? ensureLTHashStateVersion(currentSyncVersion) : newLTHashState()
 
 				encodeResult = await encodeSyncdPatch(patchCreate, myAppStateKeyId, initial, getAppStateSyncKey)
 				const { patch, state } = encodeResult
@@ -1198,6 +1237,16 @@ export const makeChatsSocket = (config: SocketConfig) => {
 			return
 		}
 
+		// On reconnection (accountSyncCounter > 0), the server does not push
+		// history sync notifications — the device already has its data.
+		// Skip the 20s wait and go online immediately.
+		if (authState.creds.accountSyncCounter > 0) {
+			logger.info('Reconnection with existing sync data, skipping history sync wait. Transitioning to Online.')
+			syncState = SyncState.Online
+			setTimeout(() => ev.flush(), 0)
+			return
+		}
+
 		logger.info('History sync is enabled, awaiting notification with a 20s timeout.')
 
 		if (awaitingSyncTimeout) {
@@ -1206,7 +1255,6 @@ export const makeChatsSocket = (config: SocketConfig) => {
 
 		awaitingSyncTimeout = setTimeout(() => {
 			if (syncState === SyncState.AwaitingInitialSync) {
-				// TODO: investigate
 				logger.warn('Timeout in AwaitingInitialSync, forcing state to Online and flushing buffer')
 				syncState = SyncState.Online
 				ev.flush()
