@@ -33,6 +33,7 @@ import { aesDecryptGCM, hmacSign } from './crypto'
 import { getKeyAuthor, toNumber } from './generics'
 import { downloadAndProcessHistorySyncNotification } from './history'
 import type { ILogger } from './logger'
+import { resolveTcTokenJid } from './tc-token-utils'
 
 type ProcessMessageContext = {
 	shouldProcessHistoryMsg: boolean
@@ -54,6 +55,63 @@ const REAL_MSG_STUB_TYPES = new Set([
 ])
 
 const REAL_MSG_REQ_ME_STUB_TYPES = new Set([WAMessageStubType.GROUP_PARTICIPANT_ADD])
+
+async function storeTcTokensFromHistorySync(
+	chats: Chat[],
+	signalRepository: SignalRepositoryWithLIDStore,
+	keyStore: SignalKeyStoreWithTransaction,
+	logger?: ILogger
+) {
+	const getLIDForPN = signalRepository.lidMapping.getLIDForPN.bind(signalRepository.lidMapping)
+
+	// Collect candidates: only chats with token AND a timestamp (tokens without
+	// timestamps are immediately expired by isTcTokenExpired, so skip them)
+	const candidates: { storageJid: string; token: Buffer; ts: number; senderTs?: number }[] = []
+	for (const chat of chats) {
+		const ts = chat.tcTokenTimestamp ? toNumber(chat.tcTokenTimestamp) : 0
+		if (chat.tcToken?.length && ts > 0) {
+			const jid = jidNormalizedUser(chat.id!)
+			const storageJid = await resolveTcTokenJid(jid, getLIDForPN)
+			candidates.push({
+				storageJid,
+				token: Buffer.from(chat.tcToken),
+				ts,
+				senderTs: chat.tcTokenSenderTimestamp ? toNumber(chat.tcTokenSenderTimestamp) : undefined
+			})
+		}
+	}
+
+	if (!candidates.length) {
+		return
+	}
+
+	// Monotonicity guard: don't overwrite fresher tokens from notifications
+	const jids = candidates.map(c => c.storageJid)
+	const existing = await keyStore.get('tctoken', jids)
+	const entries: Record<string, { token: Buffer; timestamp?: string; senderTimestamp?: number }> = {}
+
+	for (const c of candidates) {
+		const existingTs = existing[c.storageJid]?.timestamp ? Number(existing[c.storageJid]!.timestamp) : 0
+		if (existingTs > 0 && existingTs >= c.ts) {
+			continue
+		}
+
+		entries[c.storageJid] = {
+			token: c.token,
+			timestamp: String(c.ts),
+			...(c.senderTs ? { senderTimestamp: c.senderTs } : {})
+		}
+	}
+
+	if (Object.keys(entries).length) {
+		logger?.debug({ count: Object.keys(entries).length }, 'storing tctokens from history sync')
+		try {
+			await keyStore.set({ tctoken: entries })
+		} catch (err) {
+			logger?.warn({ err }, 'failed to store tctokens from history sync')
+		}
+	}
+}
 
 /** Cleans a received message to further processing */
 export const cleanMessage = (message: WAMessage, meId: string, meLid: string) => {
@@ -287,19 +345,19 @@ const processMessage = async (
 
 					const data = await downloadAndProcessHistorySyncNotification(histNotification, options, logger)
 
-					// Emit LID-PN mappings from history sync
-					// This is how WhatsApp Web learns mappings for chats with non-contacts
 					if (data.lidPnMappings?.length) {
 						logger?.debug({ count: data.lidPnMappings.length }, 'processing LID-PN mappings from history sync')
-						// eslint-disable-next-line max-depth
-						for (const mapping of data.lidPnMappings) {
-							ev.emit('lid-mapping.update', mapping)
-						}
+						await signalRepository.lidMapping
+							.storeLIDPNMappings(data.lidPnMappings)
+							.catch(err => logger?.warn({ err }, 'failed to store LID-PN mappings from history sync'))
 					}
+
+					await storeTcTokensFromHistorySync(data.chats, signalRepository, keyStore, logger)
 
 					ev.emit('messaging-history.set', {
 						...data,
 						isLatest: histNotification.syncType !== proto.HistorySync.HistorySyncType.ON_DEMAND ? isLatest : undefined,
+						chunkOrder: histNotification.chunkOrder,
 						peerDataRequestSessionId: histNotification.peerDataRequestSessionId
 					})
 				}
@@ -349,21 +407,51 @@ const processMessage = async (
 			case proto.Message.ProtocolMessage.Type.PEER_DATA_OPERATION_REQUEST_RESPONSE_MESSAGE:
 				const response = protocolMsg.peerDataOperationRequestResponseMessage!
 				if (response) {
-					await placeholderResendCache?.del(response.stanzaId!)
 					// TODO: IMPLEMENT HISTORY SYNC ETC (sticker uploads etc.).
-					const { peerDataOperationResult } = response
-					for (const result of peerDataOperationResult!) {
-						const { placeholderMessageResendResponse: retryResponse } = result
+					const peerDataOperationResult = response.peerDataOperationResult || []
+					for (const result of peerDataOperationResult) {
+						const retryResponse = result?.placeholderMessageResendResponse
 						//eslint-disable-next-line max-depth
-						if (retryResponse) {
-							const webMessageInfo = proto.WebMessageInfo.decode(retryResponse.webMessageInfoBytes!)
-							// wait till another upsert event is available, don't want it to be part of the PDO response message
-							// TODO: parse through proper message handling utilities (to add relevant key fields)
+						if (!retryResponse?.webMessageInfoBytes) {
+							continue
+						}
+
+						//eslint-disable-next-line max-depth
+						try {
+							const webMessageInfo = proto.WebMessageInfo.decode(retryResponse.webMessageInfoBytes)
+							const msgId = webMessageInfo.key?.id
+							// Retrieve cached original message data (preserves LID details,
+							// timestamps, etc. that the phone may omit in its PDO response)
+							const cachedData = msgId ? await placeholderResendCache?.get<Partial<WAMessage> | true>(msgId) : undefined
+							//eslint-disable-next-line max-depth
+							if (msgId) {
+								await placeholderResendCache?.del(msgId)
+							}
+
+							let finalMsg: WAMessage
+							//eslint-disable-next-line max-depth
+							if (cachedData && typeof cachedData === 'object') {
+								// Apply decoded message content onto cached metadata (preserves LID etc.)
+								cachedData.message = webMessageInfo.message
+								//eslint-disable-next-line max-depth
+								if (webMessageInfo.messageTimestamp) {
+									cachedData.messageTimestamp = webMessageInfo.messageTimestamp
+								}
+
+								finalMsg = cachedData as WAMessage
+							} else {
+								finalMsg = webMessageInfo as WAMessage
+							}
+
+							logger?.debug({ msgId, requestId: response.stanzaId }, 'received placeholder resend')
+
 							ev.emit('messages.upsert', {
-								messages: [webMessageInfo as WAMessage],
+								messages: [finalMsg],
 								type: 'notify',
 								requestId: response.stanzaId!
 							})
+						} catch (err) {
+							logger?.warn({ err, stanzaId: response.stanzaId }, 'failed to decode placeholder resend response')
 						}
 					}
 				}

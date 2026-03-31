@@ -429,7 +429,7 @@ export const makeSocket = (config: SocketConfig) => {
 
 		logger.trace({ handshake }, 'handshake recv from WA')
 
-		const keyEnc = await noise.processHandshake(handshake, creds.noiseKey)
+		const keyEnc = noise.processHandshake(handshake, creds.noiseKey)
 
 		let node: proto.IClientPayload
 		if (!creds.me) {
@@ -971,9 +971,17 @@ export const makeSocket = (config: SocketConfig) => {
 
 	ws.on('CB:stream:error', (node: BinaryNode) => {
 		const [reasonNode] = getAllBinaryNodeChildren(node)
-		logger.error({ reasonNode, fullErrorNode: node }, 'stream errored out')
-
 		const { reason, statusCode } = getErrorCodeFromStreamError(node)
+
+		if (reason === 'device_removed') {
+			logger.error({ node }, 'stream error: device removed — logging out')
+		} else if (reason === 'xml-not-well-formed') {
+			logger.warn({ node }, 'stream error: sent malformed stanza (xml-not-well-formed)')
+		} else if (reason === 'ack') {
+			logger.warn({ ackId: reasonNode?.attrs?.id, node }, 'stream error: ack-based error')
+		} else {
+			logger.error({ reason, statusCode, node }, 'stream errored out')
+		}
 
 		void end(new Boom(`Stream Errored (${reason})`, { statusCode, data: reasonNode || node }))
 	})
