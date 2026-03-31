@@ -38,6 +38,7 @@ import { makeKeyedMutex } from '../Utils/make-mutex'
 import { getMessageReportingToken, shouldIncludeReportingToken } from '../Utils/reporting-utils'
 import {
 	isTcTokenExpired,
+	resolveIssuanceJid,
 	resolveTcTokenJid,
 	shouldSendNewTcToken,
 	storeTcTokensFromIqResult
@@ -51,13 +52,16 @@ import {
 	getBinaryNodeChildren,
 	isHostedLidUser,
 	isHostedPnUser,
+	isJidBot,
 	isJidGroup,
+	isJidMetaAI,
 	isLidUser,
 	isPnUser,
 	jidDecode,
 	jidEncode,
 	jidNormalizedUser,
 	type JidWithDevice,
+	PSA_WID,
 	S_WHATSAPP_NET
 } from '../WABinary'
 import { USyncQuery, USyncUser } from '../WAUSync'
@@ -1043,7 +1047,7 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 				}
 			}
 
-			if (tcTokenBuffer?.length) {
+			if (tcTokenBuffer?.length && sock.serverProps.privacyTokenOn1to1) {
 				;(stanza.content as BinaryNode[]).push({
 					tag: 'tctoken',
 					attrs: {},
@@ -1060,14 +1064,14 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 			await sendNode(stanza)
 
 			// Fire-and-forget: issue our token to the contact AFTER message send.
-			// Matches WA Web's WAWebSendTcTokenChatAction.sendTcToken which runs
-			// after encryptAndSendUserMsg, gated only by shouldSendNewToken.
-			// IMPORTANT: must happen AFTER sendNode — issuing BEFORE the message
-			// causes the server to register a privacy-token relationship and then
-			// reject the message (error 463) because the token isn't attached.
-			if (is1on1Send && shouldSendNewTcToken(existingTokenEntry?.senderTimestamp)) {
+			// WA Web skips protocol messages and PSA/bot contacts (TcTokenChatAction: isRegularUser)
+			const isProtocolMsg = !!normalizeMessageContent(message)?.protocolMessage
+			const isBotOrPSA = destinationJid === PSA_WID || isJidBot(destinationJid) || isJidMetaAI(destinationJid)
+			if (is1on1Send && !isProtocolMsg && !isBotOrPSA && shouldSendNewTcToken(existingTokenEntry?.senderTimestamp)) {
 				const issueTimestamp = unixTimestampSeconds()
-				getPrivacyTokens([destinationJid], issueTimestamp)
+				const getPNForLID = signalRepository.lidMapping.getPNForLID.bind(signalRepository.lidMapping)
+				resolveIssuanceJid(destinationJid, sock.serverProps.lidTrustedTokenIssueToLid, getLIDForPN, getPNForLID)
+					.then(issueJid => issuePrivacyTokens([issueJid], issueTimestamp))
 					.then(async result => {
 						// Store any tokens the server returned in the IQ response.
 						// Note: onNewJidStored not passed — the pruning index lives in messages-recv
@@ -1174,7 +1178,7 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 		return ''
 	}
 
-	const getPrivacyTokens = async (jids: string[], timestamp?: number) => {
+	const issuePrivacyTokens = async (jids: string[], timestamp?: number) => {
 		const t = (timestamp ?? unixTimestampSeconds()).toString()
 		const result = await query({
 			tag: 'iq',
@@ -1208,7 +1212,7 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 
 	return {
 		...sock,
-		getPrivacyTokens,
+		issuePrivacyTokens,
 		assertSessions,
 		relayMessage,
 		sendReceipt,
